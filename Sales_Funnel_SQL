@@ -1,0 +1,117 @@
+-- QUERY: Build funnel according to salesforce object classification: No salesforce field to define
+-- funnel position, so criteria needed to be called and defined through alias and union statements
+-- to build unifying funnel view.
+
+
+WITH first_time AS
+  (SELECT org_id,
+          DATE_TRUNC('day', MIN(requested_at)) AS first_ride
+   FROM hive.enterprise.fact_enterprise_rides rides
+   WHERE ds >= '2017-01-01'
+     AND status = 'finished'
+   GROUP BY 1),
+     max_date as
+  ( SELECT contact_id, account_name, MAX(opp_created_date) AS opp_date, MAX(associated_date) AS assoc_date
+   FROM hive.slane.sfdc_campaign_opp
+   WHERE associated_date >= DATE('2019-01-01')
+   GROUP BY 1,2),
+              final AS
+  (SELECT op.contact_id,
+          op.account_name,
+          op.org_slug,
+          CASE
+              WHEN opp_date <= assoc_date then 'Influenced'
+              ELSE 'Not_Influenced'
+          END AS influenced,
+          COALESCE(op.meeting,op.meeting_p) AS meeting_date,
+          op.stage,
+          ca.mql,
+          md.assoc_date AS associated_date,
+          account_segment,
+          first_ride,
+          assoc_date
+   FROM hive.slane.sfdc_dim_opp op
+   LEFT JOIN hive.enterprise.dim_orgs org
+     ON org.org_id = op.org_slug
+   LEFT JOIN hive.slane.sfdc_campaign_opp ca
+     ON op.org_slug = ca.org_slug
+   LEFT JOIN max_date md
+     ON ca.account_name = md.account_name
+   LEFT JOIN first_time ft
+     ON ft.org_id = op.org_slug
+     WHERE first_ride >= DATE('2019-01-01')
+       AND assoc_date >= DATE('2019-01-01') ), mql as
+    (SELECT lead_id, company_name AS org_id, created_at AS campaign_associated_date, COUNT(CASE
+                                                                                               WHEN mql = 1 then 1
+                                                                                           END) AS num_users, 'b.MQL' AS stage, CASE
+                                                                                                                                    WHEN lead_source NOT IN ('') THEN 'Influenced'
+                                                                                                                                    ELSE 'Not_Influenced'
+                                                                                                                                END AS influenced
+   FROM hive.slane.sfdc_dim_lead
+   WHERE DATE(created_at) >= DATE('2019-01-01')
+     AND company_name NOT IN ('Lyft')-- AND mql = 1
+GROUP BY 1,2,3,6),
+                                                   sql AS
+  (SELECT d.contact_id AS lead_id,
+          d.account_name,
+          created_date AS campaign_associated_date,
+          sum(CASE
+                  WHEN (d.mql + l.mql) > 0 THEN 1
+              END) AS num_users,
+          'c.SQL' AS stage,
+          f.influenced
+   FROM hive.slane.sfdc_dim_contacts d
+   LEFT JOIN final f
+     ON f.contact_id = d.contact_id
+   LEFT JOIN hive.slane.sfdc_dim_lead l
+     ON l.company_name = d.account_name -- WHERE DATE(associated_date) >= DATE('2019-01-01')
+GROUP BY 1,
+         2,
+         3,
+         6), closed AS
+  (SELECT o.contact_id AS lead_id,
+          o.account_name,
+          f.associated_date AS campaign_associated_date,
+          SUM(CASE
+                  WHEN o.stage = 'Closed Won' THEN 1
+              END) AS num_users,
+          'd.Closed Won' AS stage,
+          f.influenced
+   FROM hive.slane.sfdc_dim_opp o
+   LEFT JOIN final f
+     ON f.contact_id = o.contact_id -- WHERE DATE(associated_date) >= DATE('2019-01-01')
+GROUP BY 1,
+         2,
+         3,
+         6),
+             activation AS
+  (SELECT org_id AS lead_id,
+          f.account_name,
+          f.associated_date AS campaign_associated_date,
+          SUM(CASE
+                  WHEN t.first_ride >= DATE('2019-01-01') THEN 1
+              END) AS num_users,
+          'e.Activated' AS stage,
+          f.influenced
+   FROM first_time t
+   LEFT JOIN final f
+     ON f.org_slug = t.org_id
+   GROUP BY 1,
+            2,
+            3,
+            6)
+SELECT *
+FROM mql
+WHERE num_users > 0
+UNION
+SELECT *
+FROM sql
+WHERE num_users > 0
+UNION
+SELECT *
+FROM closed
+WHERE num_users > 0
+UNION
+SELECT *
+FROM activation
+WHERE num_users > 0

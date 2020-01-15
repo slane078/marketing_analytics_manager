@@ -1,0 +1,81 @@
+-- SQL INFO: Query using web data piped into main database to find UTM data
+-- for new organization creation in our self-service pipeline. 
+-- can be edited to build around all stages of self service funnel.
+-- Also built to find if marketing UTMs and Salesforce Campaigns caused the influence.
+
+
+WITH utm_base AS
+  (SELECT DISTINCT COALESCE(p.user_id, f.user_id, b.user_id) AS user_id,
+                   p.browser_session_id,
+                   p.occurred_at,
+                   COALESCE(SPLIT_PART(SPLIT_PART(page_referrer, '?utm_source=', 2), '&', 1), SPLIT_PART(SPLIT_PART(page, '?utm_source=', 2), '&', 1)) AS page_view_source,
+                   COALESCE(SPLIT_PART(SPLIT_PART(page_referrer, 'utm_medium=', 2), '&', 1), SPLIT_PART(SPLIT_PART(page, 'utm_medium=', 2), '&', 1)) AS page_view_medium,
+                   COALESCE(SPLIT_PART(SPLIT_PART(page_referrer, 'utm_campaign=', 2), '&', 1), SPLIT_PART(SPLIT_PART(page, 'utm_campaign=', 2), '&', 1)) AS page_view_campaign
+   FROM hive.default.event_www_page_view p
+   LEFT OUTER JOIN hive.default.event_www_btn_click b
+     ON p.browser_session_id = b.browser_session_id
+     AND b.value = 'Continue'
+     AND b.path like '/business/signup%'
+     AND b.ds >= '2018-09-20'
+   LEFT OUTER JOIN hive.default.event_www_business_form_action f
+     ON p.browser_session_id = f.browser_session_id
+     AND f.ds >= '2018-09-20'
+     AND event_type = 'business_create_submitted'
+     WHERE p.ds >= '2018-09-20'
+       AND page LIKE '/business/signup%'
+       AND COALESCE(SPLIT_PART(page, 'utm_', 2), SPLIT_PART(page_referrer, 'utm_', 2)) IS NOT NULL ),
+     orgs_ranked AS
+    (SELECT org_id,
+            occurred_at,
+            page_view_source,
+            page_view_medium,
+            page_view_campaign
+   FROM
+     (SELECT DISTINCT org_id,
+                      occurred_at,
+                      page_view_source,
+                      page_view_medium,
+                      page_view_campaign,
+                      RANK() OVER (PARTITION BY org_id
+                                 ORDER BY occurred_at) AS time_rnk
+      FROM utm_base u
+      JOIN hive.enterprise.dim_org_members om
+        ON u.user_id = om.user_lyft_id
+        AND om.org_id NOT LIKE 'lyft%')
+   WHERE time_rnk = 1 ),
+     max_date AS
+  (SELECT member_id,
+          org_slug,
+          MAX(opp_created_date) AS opp_date,
+          MAX(associated_date) AS assoc_date
+   FROM hive.slane.sfdc_campaign_opp
+   GROUP BY 1,
+            2) --org_creations as
+
+SELECT r.org_id,
+       DATE_TRUNC('month', prod_signed_tos_at) AS date,
+       CASE
+           WHEN (CASE
+                     WHEN assoc_date <= opp_date THEN 1
+                 END) = 1 THEN 'Influenced'
+           ELSE 'Not_Influenced'
+       END AS influenced,
+       bookings
+FROM hive.enterprise.dim_orgs o
+JOIN hive.enterprise.fact_enterprise_rides fer
+  ON fer.org_id = o.org_id
+LEFT JOIN hive.core.fact_ride_booking_groupings fg
+  ON fer.ride_id = fg.ride_id
+LEFT JOIN hive.slane.sfdc_campaign_opp op
+  ON o.org_id = op.org_slug
+LEFT JOIN max_date md
+  ON md.org_slug = op.org_slug
+JOIN orgs_ranked r
+  ON o.org_id = r.org_id
+  AND o.prod_signed_tos_at >= occurred_at
+WHERE fer.status = 'finished'
+GROUP BY 1,
+         2,
+         3,
+         4
+ORDER BY 2

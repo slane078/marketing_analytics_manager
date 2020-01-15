@@ -1,0 +1,116 @@
+-- SQL INFO: Query to pull all healthcare organizations, their revenue, and if marketing has influence
+-- on the acquisition. Only pulling for influence (Last Touch) for this Query. Will produce
+-- Month, Organization, Vertical, Revenue(bookings), and influenced data
+
+
+WITH social_orgs AS
+  (SELECT a.org_id,
+          a.sfdc_org_name,
+          a.sfdc_industry,
+          a.account_segment --COUNT(account_id) as total
+FROM hive.enterprise.dim_orgs a 
+LEFT JOIN (SELECT * from {{ @smb_industry }}) as smb on smb.org_id = a.org_id --ON a.org_id = b.org_id
+-- --org_id <> 'gogograndparentcom' AND
+WHERE (smb.industry_tag = 'Healthcare' 
+OR a.sfdc_account_vertical = 'Healthcare' OR a.sfdc_industry IN ('Healthcare General', 'Medical Practice', 'Mental Health Care', 'Pharmaceuticals', 'Hospital & Health Care', 'Healthcare', 'Hospitals & Clinics')
+)
+--GROUP BY 1,2,3,4,5
+ORDER BY 1 ASC),
+     max_date as(
+     Select 
+     org_slug,
+     MAX(opp_created_date) as opp_date,
+     MAX(associated_date) as assoc_date
+     from hive.slane.sfdc_campaign_opp
+     group by 1),
+     
+gpo_orgs as (
+Select 
+--a.sfdc_account_owner_name,
+a.org_id,
+a.sfdc_org_name,
+
+--b.account_id,
+--b.account_name,
+a.sfdc_gpo_id,
+a.sfdc_gpo_partner_id,
+a.sfdc_account_tier,
+CASE WHEN a.sfdc_account_vertical IN ('Healthcare') AND a.sfdc_account_segment in ('SMB') THEN 'SBS_Healthcare'
+ELSE '' END AS health_vertical,
+CASE WHEN a.sfdc_gpo_partner_id IN ('HPG - Healthtrust','Premier - Healthcare','Vizient - Healthcare') THEN 'GPO_Healthcare'
+     WHEN a.sfdc_gpo_partner_id NOT IN ('') AND a.sfdc_account_tier = 'Health System' THEN 'GPO_Healthcare'
+     WHEN a.sfdc_gpo_partner_id  IN ('') AND a.sfdc_account_tier = 'Health System' THEN 'Health_System'
+ELSE 'GPO_Other' END as health_type,
+CASE WHEN a.sfdc_gpo_partner_id in ('HPG - Coretrust','HPG - Healthtrust') THEN 'HPG'
+     WHEN a.sfdc_gpo_partner_id in ('Premier','Premier - Healthcare') THEN 'Premier'
+     WHEN a.sfdc_gpo_partner_id in ('Vizient','Vizient - Healthcare') THEN 'Vizient'
+     WHEN a.sfdc_gpo_partner_id  IN ('') AND a.sfdc_account_tier = 'Health System' THEN NULL
+     ELSE a.sfdc_gpo_partner_id END as gpo_partner
+--COUNT(account_id) as total
+FROM hive.enterprise.dim_orgs a
+--LEFT JOIN hive.enterprise.dim_org_accounts b 
+--ON a.org_id = b.org_id
+ 
+--org_id <> 'gogograndparentcom' AND 
+WHERE (a.sfdc_gpo_partner_id NOT IN ('') OR sfdc_account_tier = 'Health System' OR a.sfdc_account_vertical = 'Healthcare') AND a.org_id <> 'gogograndparentcom'
+--GROUP BY 1,2,3,4,5
+ORDER BY 1 ASC
+),
+     
+rides AS
+  (SELECT requested_at,
+          rides.ride_id,
+          COALESCE(gpo.org_id, orgs.org_id) as org_id,
+          rides.account_id,
+          orgs.sfdc_industry,
+          CASE
+              WHEN product = 'Contract Business Profile' THEN 'Business Profile'
+              WHEN product = 'Concierge' THEN 'Concierge'
+              ELSE 'Other'
+          END AS product,
+          book.bookings,
+          orgs.account_segment,
+          orgs.sfdc_account_vertical
+   FROM hive.enterprise.dim_orgs orgs
+   RIGHT JOIN social_orgs so on so.org_id = orgs.org_id
+   RIGHT JOIN gpo_orgs gpo on gpo.org_id = orgs.org_id
+   LEFT JOIN hive.enterprise.fact_enterprise_rides rides
+     ON rides.org_id = orgs.org_id
+     AND rides.ds >= '2019-01-01'
+     AND status = 'finished'
+   LEFT JOIN hive.core.fact_ride_booking_groupings book
+     ON book.ride_id = rides.ride_id
+     AND book.ds >= '2019-01-01'
+   ORDER BY requested_at DESC )
+   
+   
+SELECT DATE_TRUNC('month', fer.requested_at) AS
+date,
+fer.org_id, 
+-- gpo_partner,
+-- health_type,
+-- health_vertical,
+-- product,
+-- op.campaign_name,
+-- added,
+account_segment,
+         fer.bookings,
+         CASE
+             WHEN op.campaign_name NOT IN ('')
+                  AND (CASE
+                           WHEN DATE(md.assoc_date) <= DATE(md.opp_date) THEN 1
+                       END) > 0 THEN 'Influenced'
+             WHEN product = 'Other' THEN 'Non-Contracted' ELSE 'Contracted'
+         END AS influenced
+FROM rides fer
+LEFT JOIN hive.slane.sfdc_campaign_opp op
+  ON fer.org_id = op.org_slug
+LEFT JOIN max_date md ON md.org_slug = op.org_slug
+WHERE DATE_TRUNC('month', fer.requested_at) BETWEEN CAST('2019-01-01' AS timestamp) AND DATE_TRUNC('day', CURRENT_DATE)
+  AND fer.org_id <> 'gogograndparentcom'
+GROUP BY 1,
+         2,
+         5,
+         3,
+         4
+ORDER BY 4 DESC

@@ -1,0 +1,109 @@
+    -- QUERY INFORMATION:
+    -- SQL used to find first and last touch attribution of salesforce campaigns
+    -- All orgs that have been attributed to campaigns
+    -- All bookings attributed to the orgs
+    -- Split attribution of bookings between first/last touch
+    -- NEXT STEPS: Attribution to last touch before "Closed Won"
+    -- Current Last Touch: last touch before opportunity creation
+
+
+with max_opp as
+  (SELECT o.contact_id, o.campaign_name, o.campaign_type, o.associated_date AS max_date, o.opp_type
+   FROM hive.slane.sfdc_campaign_opp_all o
+   LEFT JOIN hive.slane.sfdc_campaign_opp_all oo
+     ON (o.contact_id = oo.contact_id
+         AND oo.associated_date > o.associated_date)
+   WHERE o.associated_date <= o.opp_created_date
+     AND oo.associated_date IS NULL
+     AND o.responded = 1
+   GROUP BY 1,2,3,4,5
+   ORDER BY 1),
+             min_opp as
+  (SELECT o.contact_id, o.campaign_name, o.campaign_type, o.associated_date AS min_date, o.opp_type
+   FROM hive.slane.sfdc_campaign_opp_all o
+   LEFT JOIN hive.slane.sfdc_campaign_opp_all oo
+     ON (o.contact_id = oo.contact_id
+         AND oo.associated_date < o.associated_date)
+   WHERE o.associated_date <= o.opp_created_date
+     AND oo.associated_date IS NULL
+     AND o.responded = 1
+   GROUP BY 1,2,3,4,5
+   ORDER BY 1),
+                     rides AS
+  (SELECT fer.org_id,
+          fer.account_id,
+          region,
+          requested_at,
+          status,
+          product,
+          bookings
+   FROM hive.enterprise.fact_enterprise_rides fer
+   LEFT JOIN hive.core.fact_ride_booking_groupings fg
+     ON fer.ride_id = fg.ride_id
+     AND fer.status = 'finished'
+     AND requested_at >= DATE('2019-01-01')
+   ORDER BY requested_at DESC) -- attribution as (
+
+SELECT distinct op.org_slug,
+                CASE
+                    WHEN mn.campaign_type IN ('',
+                                              'Other',
+                                              NULL,
+                                              'Sign Up/Trial',
+                                              'Referral Program') THEN 'Non_Marketing'
+                    WHEN mn.campaign_type = 'Conference' then 'Conference - Enterprise'
+                    ELSE mn.campaign_type
+                END AS campaign_type,
+                mn.campaign_name AS campaign_name,
+                CASE
+                    WHEN mn.opp_type = 'Existing Business' then 'Expansion'
+                    ELSE mn.opp_type
+                END AS opp_type,
+                'First Touch' AS stage,
+                min_date AS associated_date,
+                SUM(distinct r.bookings) / 2 AS bookings,
+                count(distinct r.requested_at) / 2 AS ride_count
+FROM hive.slane.sfdc_campaign_opp_all op
+JOIN rides r
+  ON r.org_id = op.org_slug
+INNER JOIN min_opp mn
+  ON op.contact_id = mn.contact_id
+WHERE requested_at >= opp_created_date
+GROUP BY 1,
+         2,
+         3,
+         4,
+         5,
+         6
+UNION
+SELECT distinct op.org_slug,
+                CASE
+                    WHEN mx.campaign_type IN ('',
+                                              'Other',
+                                              NULL,
+                                              'Sign Up / Trial',
+                                              'Referral Program') THEN 'Non_Marketing'
+                    WHEN mx.campaign_type = 'Conference' then 'Conference - Enterprise'
+                    ELSE mx.campaign_type
+                END AS campaign_type,
+                mx.campaign_name AS campaign_name,
+                CASE
+                    WHEN mx.opp_type = 'Existing Business' then 'Expansion'
+                    ELSE mx.opp_type
+                END AS opp_type,
+                'Last Touch' AS stage,
+                max_date AS associated_date,
+                SUM(distinct r.bookings) / 2 AS bookings,
+                COUNT(distinct r.requested_at) / 2 AS ride_count
+FROM hive.slane.sfdc_campaign_opp_all op
+JOIN rides r
+  ON r.org_id = op.org_slug
+INNER JOIN max_opp mx
+  ON op.contact_id = mx.contact_id
+WHERE requested_at >= opp_created_date
+GROUP BY 1,
+         2,
+         3,
+         4,
+         5,
+         6

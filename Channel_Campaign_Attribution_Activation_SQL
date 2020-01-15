@@ -1,0 +1,84 @@
+
+    -- SQL query to pull the following:
+        -- First Touch campaign information
+        -- Last Touch campaign information
+        -- Joining bookings information for each org based on first touch campaign
+        -- Joining bookings information for each org based on last touch campaign
+    -- Union first/last touch data and using to show # of organizations who are 
+    -- marketing attributed, assigning 50% of org activation to each touch
+
+
+with max_opp as(
+SELECT 
+o.contact_id,
+o.campaign_name,
+o.campaign_type,
+o.associated_date as max_date,
+o.opp_type
+from hive.slane.sfdc_campaign_opp_all o 
+LEFT JOIN hive.slane.sfdc_campaign_opp_all oo on (o.contact_id = oo.contact_id AND oo.associated_date > o.associated_date)
+WHERE o.associated_date <= o.opp_created_date
+and oo.associated_date IS NULL
+and o.responded = 1
+GROUP BY 1,2,3,4,5
+ORDER BY 1),
+
+min_opp as(
+SELECT 
+o.contact_id,
+o.campaign_name,
+o.campaign_type,
+o.associated_date as min_date,
+o.opp_type
+from hive.slane.sfdc_campaign_opp_all o 
+LEFT JOIN hive.slane.sfdc_campaign_opp_all oo on (o.contact_id = oo.contact_id AND oo.associated_date < o.associated_date)
+WHERE o.associated_date <= o.opp_created_date
+and oo.associated_date IS NULL
+and o.responded = 1
+GROUP BY 1,2,3,4,5
+ORDER BY 1),
+
+rides as (
+Select 
+fer.org_id,
+requested_at,
+bookings
+FROM hive.enterprise.fact_enterprise_rides fer
+LEFT JOIN hive.core.fact_ride_booking_groupings fg
+  ON fer.ride_id = fg.ride_id
+  AND fer.status = 'finished'
+Order by requested_at DESC
+)
+-- attribution as (
+SELECT 
+mn.campaign_name as campaign_name,
+(COUNT(distinct op.org_slug) / 2) as org_count,
+CASE WHEN mn.campaign_type IN ('','Other', NULL, 'Sign Up/Trial', 'Referral Program') THEN 'Non_Marketing'
+  WHEN mn.campaign_type = 'Conference' then 'Conference - Enterprise' else mn.campaign_type END AS campaign_type,
+CASE WHEN mn.opp_type = 'Existing Business' then 'Expansion' ELSE mn.opp_type end as opp_type,
+'First Touch' as stage,
+min_date as associated_date,
+SUM(distinct r.bookings) / 2 as bookings
+FROM hive.slane.sfdc_campaign_opp_all op
+JOIN rides r on r.org_id = op.org_slug
+INNER JOIN min_opp mn on op.contact_id = mn.contact_id
+where requested_at >= opp_created_date
+GROUP BY 1,3,5,4,6
+
+UNION
+
+SELECT 
+mx.campaign_name as campaign_name,
+(COUNT(distinct op.org_slug) / 2)as org_count,
+CASE WHEN mx.campaign_type IN ('','Other', NULL, 'Sign Up/Trial', 'Referral Program') THEN 'Non_Marketing'
+  WHEN mx.campaign_type = 'Conference' then 'Conference - Enterprise' else mx.campaign_type END AS campaign_type,
+
+CASE WHEN mx.opp_type = 'Existing Business' then 'Expansion' ELSE mx.opp_type end as opp_type,
+'Last Touch' as stage,
+max_date as associated_date,
+SUM(distinct r.bookings) / 2 as bookings
+FROM hive.slane.sfdc_campaign_opp_all op
+JOIN rides r on r.org_id = op.org_slug
+INNER JOIN max_opp mx on op.contact_id = mx.contact_id
+where requested_at >= opp_created_date
+GROUP BY 1,3,5,4,6
